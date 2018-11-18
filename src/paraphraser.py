@@ -25,10 +25,7 @@ from tensorflow.python.layers.core import Dense
 from tensorflow.python.util import nest
 
 from tensorflow.contrib.seq2seq.python.ops import attention_wrapper
-# from tensorflow.contrib.seq2seq.python.ops import beam_search_decoder
-import beam_search_decoder
-import dynamic_decode
-import custom_dd
+from tensorflow.contrib.seq2seq.python.ops import beam_search_decoder
 
 import os, glob, gzip, time
 import logging
@@ -61,24 +58,6 @@ from tensorflow.python.util import nest
 
 import tensorflow as tf
 
-__all__ = ["Decoder", "dynamic_decode"]
-
-
-_transpose_batch_time = rnn._transpose_batch_time  # pylint: disable=protected-access
-_zero_state_tensors = rnn_cell_impl._zero_state_tensors  # pylint: disable=protected-access
-
-
-
-
-def _create_zero_outputs(size, dtype, batch_size):
-    """Create a zero outputs Tensor structure."""
-    def _create(s, d):
-        return _zero_state_tensors(s, batch_size, d)
-
-    return nest.map_structure(_create, size, dtype)
-
-
-
 class Paraphraser(Model):
 
     def get_dataset(self, source, target):
@@ -94,7 +73,7 @@ class Paraphraser(Model):
         dataset  = tf.data.Dataset.zip((source, target_inp, target_out))
         #Filter sents greater than 15
         dataset  = dataset.filter(lambda orig, para_inp, para_out: tf.logical_and(tf.logical_and(
-                                                                    tf.greater(25, tf.size(orig)), tf.greater(25, tf.size(para_inp))), tf.greater(25, tf.size(para_out))))
+                                                                    tf.greater(20, tf.size(orig)), tf.greater(20, tf.size(para_inp))), tf.greater(20, tf.size(para_out))))
         #lookup indexes
         dataset  = dataset.map(lambda orig, para_inp, para_out: ((self.vocab_table.lookup(orig), tf.size(orig)),
                                                                  (self.vocab_table.lookup(para_inp), tf.size(para_inp)),
@@ -116,9 +95,8 @@ class Paraphraser(Model):
         '''
         self.id2w        = json.load(open('../data/quora/id2w.json'))
         self.w2id        = json.load(open('../data/quora/w2id.json'))
-        self.vocab           = sorted([wrd for idx, wrd in self.id2w.items()])
+        self.vocab       = sorted([wrd for idx, wrd in self.id2w.items()])
         self.vocab_table = tf.contrib.lookup.index_table_from_tensor(mapping=tf.constant(self.vocab), num_oov_buckets=0, default_value=0)
-
         self.id2w        = {idx: self.vocab[idx] for idx in range(len(self.vocab))}
 
         print("loading data")
@@ -128,7 +106,7 @@ class Paraphraser(Model):
 
         val_orig_sents = tf.data.TextLineDataset('../data/quora/val_fortrain_100000_orig.txt')
         val_para_sents = tf.data.TextLineDataset('../data/quora/val_fortrain_100000_para.txt')
-        # pdb.set_trace()
+
         self.train_dataset = self.get_dataset(orig_sents, para_sents)
         self.val_dataset   = self.get_dataset(val_orig_sents, val_para_sents)
 
@@ -139,11 +117,11 @@ class Paraphraser(Model):
 
 
         (self.enc_inp, self.enc_inp_len), (self.dec_inp, self.dec_inp_len), (self.dec_out, self.dec_out_len)  = self.iterator.get_next()
-        # (self.val_source, self.val_source_len), (self.val_target_inp, self.val_target_len), (self.val_target_out, self.val_target_len)  = self.val_iterator.get_next()
 
     def build_single_cell(self):
         if (self.p.cell_type.lower() == 'gru'): cell_type = GRUCell
-        else:                   cell_type = LSTMCell
+        else:                                   cell_type = LSTMCell
+
         cell = cell_type(self.p.hidden_size)
 
         if self.p.use_dropout:  cell = DropoutWrapper(cell, dtype=self.p.dtype, output_keep_prob=self.keep_prob_placeholder)    #change this
@@ -156,9 +134,9 @@ class Paraphraser(Model):
         return MultiRNNCell([self.build_single_cell() for i in range(self.p.depth)])
 
     def build_dec_cell(self):
-        if self.use_beam_search:
+        if self.use_beam_search:    #then tile
             self.logger.info("using beam search decoding")
-            enc_outputs     = seq2seq.tile_batch(self.enc_outputs, multiplier=self.p.beam_width)
+            enc_outputs         = seq2seq.tile_batch(self.enc_outputs, multiplier=self.p.beam_width)
             enc_last_state      = nest.map_structure( lambda s: seq2seq.tile_batch(s, self.p.beam_width), self.enc_last_state)
             enc_inputs_length   = seq2seq.tile_batch(self.enc_inp_len, self.p.beam_width)
 
@@ -172,8 +150,6 @@ class Paraphraser(Model):
         else:
             self.attention_mechanism = attention_wrapper.BahdanauAttention(num_units=self.p.hidden_size, memory=enc_outputs, memory_sequence_length=enc_inputs_length)
 
-        # dec_cell_list = [self.build_single_cell() for i in range(self.p.depth)]
-
         def attn_dec_input_fn(inputs, attention):
             if not self.p.attn_input_feeding:
                 return inputs
@@ -181,17 +157,17 @@ class Paraphraser(Model):
                 _input_layer = Dense(self.p.hidden_size, dtype=self.p.dtype, name='attn_input_feeding')
                 return _input_layer(tf.concat([inputs, attention], -1))
 
-        self.dec_cell_list = [self.build_single_cell() for i in range(self.p.depth)]
-        self.dec_cell_list[-1] = attention_wrapper.AttentionWrapper(cell         = self.dec_cell_list[-1],
+        self.dec_cell_list     = [self.build_single_cell() for i in range(self.p.depth)]
+        self.dec_cell_list[-1] = attention_wrapper.AttentionWrapper(cell                 = self.dec_cell_list[-1],
                                                                     attention_mechanism  = self.attention_mechanism,
                                                                     attention_layer_size = self.p.hidden_size,
-                                                                    cell_input_fn    = attn_dec_input_fn,
+                                                                    cell_input_fn        = attn_dec_input_fn,
                                                                     initial_cell_state   = enc_last_state[-1],
                                                                     alignment_history    = False,
-                                                                    name         = 'attention_wrapper')
+                                                                    name                 = 'attention_wrapper')
 
-        batch_size       = self.p.batch_size if not self.use_beam_search else self.p.batch_size*self.p.beam_width
-        initial_state    = [state for state in enc_last_state]
+        batch_size           = self.p.batch_size if not self.use_beam_search else self.p.batch_size*self.p.beam_width
+        initial_state        = [state for state in enc_last_state]
         initial_state[-1]    = self.dec_cell_list[-1].zero_state(batch_size=batch_size, dtype=self.p.dtype)
         dec_initial_state    = tuple(initial_state)
 
@@ -200,23 +176,26 @@ class Paraphraser(Model):
 
     def add_model(self):
         with tf.variable_scope("embed_lookup"):
-            _wrd_embed    = tf.get_variable('embed_matrix',   [len(self.vocab)-1,  self.p.embed_dim], initializer=tf.contrib.layers.xavier_initializer(), regularizer=self.regularizer)
+            #modify initializer here to add glove/word2vec
+            _wrd_embed    = tf.get_variable('embed_matrix',   [len(self.vocab)-1,  self.p.embed_dim],
+                                            initializer=tf.contrib.layers.xavier_initializer(), regularizer=self.regularizer)
+
             wrd_pad       = tf.Variable(tf.zeros([1, self.p.embed_dim]), trainable=False)
             self.embed_matrix = tf.concat([_wrd_embed, wrd_pad], axis=0)
 
-        #Embed the source and target sentences
+        #Embed the source and target sentences. Elmo can be added here
         self.enc_inp_embed = tf.nn.embedding_lookup(self.embed_matrix, self.enc_inp)
         self.dec_inp_embed = tf.nn.embedding_lookup(self.embed_matrix, self.dec_inp)
 
         self.logger.info("Building encoder")
         with tf.variable_scope('encoder'):
-            self.enc_cell             = self.build_enc_cell()
-            self.enc_outputs, self.enc_last_state = tf.nn.dynamic_rnn(  cell        = self.enc_cell,
-                                                                        inputs      = self.enc_inp_embed,
+            self.enc_cell                         = self.build_enc_cell()
+            self.enc_outputs, self.enc_last_state = tf.nn.dynamic_rnn(  cell            = self.enc_cell,
+                                                                        inputs          = self.enc_inp_embed,
                                                                         sequence_length = self.enc_inp_len,
-                                                                        dtype       = self.p.dtype,
+                                                                        dtype           = self.p.dtype,
                                                                         time_major      = False,
-                                                                        scope       = 'enc_rnn')
+                                                                        scope           = 'enc_rnn')
 
         self.logger.info("Building decoder")
         with tf.variable_scope("decoder"):
@@ -224,80 +203,76 @@ class Paraphraser(Model):
             self.dec_cell, self.dec_initial_state = self.build_dec_cell()
 
             input_layer     = Dense(self.p.hidden_size, name="input_projection")
-            output_layer    = Dense(len(self.vocab), name="output_projection")
-
+            output_layer    = Dense(len(self.vocab),    name="output_projection")
 
             if self.p.mode == 'train':
-                self.dec_inp_embed = input_layer(self.dec_inp_embed)
-                training_helper   = seq2seq.TrainingHelper(inputs=self.dec_inp_embed, sequence_length=self.dec_inp_len, time_major=False, name='training_helper')
-                training_decoder  = seq2seq.BasicDecoder(cell=self.dec_cell, helper=training_helper, initial_state=self.dec_initial_state, output_layer=output_layer)
-                #max decode timesteps in current batch
+                self.dec_inp_embed = input_layer(self.dec_inp_embed) #decoder inputs dim should match encoder outputs dim
+                training_helper    = seq2seq.TrainingHelper(inputs=self.dec_inp_embed, sequence_length=self.dec_inp_len, time_major=False, name='training_helper')
+                training_decoder   = seq2seq.BasicDecoder(cell=self.dec_cell, helper=training_helper, initial_state=self.dec_initial_state, output_layer=output_layer)
                 max_decoder_length = tf.reduce_max(self.dec_inp_len)
 
-                (self.dec_outputs_train, self.dec_last_state_train, self.dec_outputs_length_train) = (seq2seq.dynamic_decode(decoder        = training_decoder,
+                (self.dec_outputs_train, self.dec_last_state_train, self.dec_outputs_length_train) = (seq2seq.dynamic_decode(decoder            = training_decoder,
                                                                                                                              output_time_major  = False,
                                                                                                                              impute_finished    = True,
                                                                                                                              maximum_iterations = max_decoder_length)
-                                                                                                                            )
+                                                                                                      )
 
                 #since output layer is passed to decoder, logits = output
-                self.dec_logits_train   = tf.identity(self.dec_outputs_train.rnn_output)
+                self.dec_logits_train   = self.dec_outputs_train.rnn_output
                 self.dec_pred_train     = tf.argmax(self.dec_logits_train, axis=-1, name='decoder_pred_train')
-                # to_pad          = tf.maximum(0, tf.shape(self.dec_inp)[1] - max_decoder_length)
-                masks           = tf.sequence_mask(lengths=self.dec_inp_len, maxlen=tf.shape(self.dec_inp)[1], dtype=self.p.dtype, name='masks')
-                # paddings = tf.zeros(shape=[self.p.batch_size, to_pad, len(self.vocab)])
-                # self.dec_logits_train = tf.concat([self.dec_logits_train, paddings], axis=1)
-                self.loss = seq2seq.sequence_loss(logits            = self.dec_logits_train,
-                                                       targets          = self.dec_out,
-                                                       weights          = masks,
+                masks                   = tf.sequence_mask(lengths=self.dec_inp_len, maxlen=tf.shape(self.dec_inp)[1], dtype=self.p.dtype, name='masks')
+
+                self.loss = seq2seq.sequence_loss(logits                        = self.dec_logits_train,
+                                                       targets                  = self.dec_out,
+                                                       weights                  = masks,
                                                        average_across_timesteps = True,
                                                        average_across_batch     = True)
 
                 tf.summary.scalar('loss', self.loss)
 
             #------------------------------------------------------------------THIS PART IS FOR DECODING ONLY----------------------------------------------------------------------
-            elif self.p.mode == 'decode':
-                start_tokens = tf.ones([self.p.batch_size], tf.int32) * tf.cast(self.vocab_table.lookup(tf.constant('<sos>')), tf.int32)
-                # pdb.set_trace()
-                end_token    = tf.cast(self.vocab_table.lookup(tf.constant('<eos>')), tf.int32)
+            self.logger.info("building decoder for inference")
+            start_tokens = tf.ones([self.p.batch_size], tf.int32) * tf.cast(self.vocab_table.lookup(tf.constant('<sos>')), tf.int32)
+            # pdb.set_trace()
+            end_token    = tf.cast(self.vocab_table.lookup(tf.constant('<eos>')), tf.int32)
 
-                def embed_and_input_proj(inputs):
-                    return input_layer(tf.nn.embedding_lookup(self.embed_matrix, inputs))
+            def embed_and_input_proj(inputs):
+                return input_layer(tf.nn.embedding_lookup(self.embed_matrix, inputs))
 
-                if not self.use_beam_search:
-                    self.logger.info("Building greedy decoder")
+            if not self.use_beam_search:
+                self.logger.info("Building greedy decoder")
 
-                    decoding_helper     = seq2seq.GreedyEmbeddingHelper(start_tokens = start_tokens,
-                                                                            end_token    = end_token,
-                                                                            embedding    = embed_and_input_proj)
+                decoding_helper     = seq2seq.GreedyEmbeddingHelper(start_tokens = start_tokens,
+                                                                        end_token    = end_token,
+                                                                        embedding    = embed_and_input_proj)
 
-                    inference_decoder       = seq2seq.BasicDecoder( cell            = self.dec_cell,
-                                                                    helper          = decoding_helper,
-                                                                    initial_state   = self.dec_initial_state,
-                                                                    output_layer    = output_layer)
+                inference_decoder       = seq2seq.BasicDecoder( cell            = self.dec_cell,
+                                                                helper          = decoding_helper,
+                                                                initial_state   = self.dec_initial_state,
+                                                                output_layer    = output_layer)
 
-                    self.dec_pred_decode = tf.expand_dims(self.dec_outputs_decode.sample_id, -1)        #batchsize X seq_len X 1
+            else:
+                self.logger.info("Building beam search decoder")
 
-                else:
-                    self.logger.info("Building beam search decoder")
+                self.inputs_placeholder = tf.placeholder(tf.float32, shape=[self.p.batch_size, self.p.beam_width])
 
-                    self.inputs_placeholder = tf.placeholder(tf.float32, shape=[self.p.batch_size, self.p.beam_width])
+                inference_decoder = beam_search_decoder.BeamSearchDecoder(  cell          = self.dec_cell,
+                                                                            embedding     = embed_and_input_proj,
+                                                                            start_tokens  = start_tokens,
+                                                                            end_token     = end_token,
+                                                                            initial_state = self.dec_initial_state,
+                                                                            beam_width    = self.p.beam_width,
+                                                                            output_layer  = output_layer)
 
-                    self.inference_decoder = beam_search_decoder.BeamSearchDecoder(  cell       = self.dec_cell,
-                                                                                embedding           = embed_and_input_proj,
-                                                                                start_tokens    = start_tokens,
-                                                                                end_token           = end_token,
-                                                                                initial_state   = self.dec_initial_state,
-                                                                                beam_width          = self.p.beam_width,
-                                                                                output_layer    = output_layer)
+            (self.dec_out_decode, self.dec_last_state_decode,
+             self.dec_out_length_decode) = (seq2seq.dynamic_decode( inference_decoder_para, output_time_major=False, maximum_iterations=self.max_decode_step))
 
-                # (self.dec_outputs_decode, self.dec_last_state_decode, self.decodec_outputs_length_decdoe, self.next_outputs, self.ta) = (custom_dd.dynamic_decode(inference_decoder,
-                #                                                                                                                       output_time_major = False,
-                #                                                                                                                       maximum_iterations = self.p.max_decode_step))
-
-                # if not self.use_beam_search:
-                # else:
-                #       self.dec_pred_decode = self.dec_outputs_decode.predicted_ids                        #batch_size X seq_len X beam_width
+            if not self.use_beam_search_decode:
+                #batchsize X seq_len X 1
+                self.dec_pred_decode = tf.expand_dims(self.dec_out_decode.sample_id, -1)
+            else:
+                #batch_size X seq_len X beam_width
+                self.dec_pred_decode = self.dec_out_decode.predicted_ids
 
     def get_accuracy(self):
         ''' Implement BLEU scores here
@@ -312,7 +287,7 @@ class Paraphraser(Model):
     def add_optimizer(self, loss):
         with tf.name_scope('Optimizer'):
             if self.p.opt == 'adam':  optimizer = tf.train.AdamOptimizer(self.p.lr)
-            else:             optimizer = tf.train.GradientDescentOptimizer(self.p.lr)
+            else:                     optimizer = tf.train.GradientDescentOptimizer(self.p.lr)
 
             train_op  = optimizer.minimize(loss)
 
@@ -357,115 +332,18 @@ class Paraphraser(Model):
                 f.write(txt+'\n')
             f.write('\n')
 
-    def dynamic_decode(self, decoder, output_time_major=False, impute_finished=False, maximum_iterations=None, scope=None):
-
-        with variable_scope.variable_scope(scope, "decoder") as varscope:
-            # Determine context types.
-            ctxt            = ops.get_default_graph()._get_control_flow_context()  # pylint: disable=protected-access
-            is_xla          = control_flow_util.GetContainingXLAContext(ctxt) is not None
-            in_while_loop   = (control_flow_util.GetContainingWhileContext(ctxt) is not None)
-
-            if not context.executing_eagerly() and not in_while_loop:
-                if varscope.caching_device is None:
-                    varscope.set_caching_device(lambda op: op.device)
-
-            if maximum_iterations is not None:
-                maximum_iterations = ops.convert_to_tensor(maximum_iterations, dtype=dtypes.int32, name="maximum_iterations")
-                if maximum_iterations.get_shape().ndims != 0:
-                    raise ValueError("maximum_iterations must be a scalar")
-
-            initial_finished, initial_inputs, initial_state = decoder.initialize()
-
-            zero_outputs = _create_zero_outputs(decoder.output_size, decoder.output_dtype, decoder.batch_size)
-
-            if is_xla and maximum_iterations is None:
-                raise ValueError("maximum_iterations is required for XLA compilation.")
-
-            if maximum_iterations is not None:
-                initial_finished     = math_ops.logical_or(initial_finished, 0 >= maximum_iterations)
-
-            initial_sequence_lengths = array_ops.zeros_like(initial_finished, dtype=dtypes.int32)
-            initial_time             = constant_op.constant(0, dtype=dtypes.int32)
-
-            def _shape(batch_size, from_shape):
-                if (not isinstance(from_shape, tensor_shape.TensorShape) or from_shape.ndims == 0):
-                    return tensor_shape.TensorShape(None)
-                else:
-                    batch_size = tensor_util.constant_value(ops.convert_to_tensor(batch_size, name="batch_size"))
-                    return tensor_shape.TensorShape([batch_size]).concatenate(from_shape)
-
-            dynamic_size = maximum_iterations is None or not is_xla
-
-            def _create_ta(s, d):
-                return tensor_array_ops.TensorArray(dtype=d, size=0 if dynamic_size else maximum_iterations, dynamic_size=dynamic_size, element_shape=_shape(decoder.batch_size, s))
-
-            initial_outputs_ta = nest.map_structure(_create_ta, decoder.output_size, decoder.output_dtype)
-
-            def body(time, outputs_ta, state, inputs, finished, sequence_lengths):
-
-                (next_outputs, decoder_state, next_inputs, decoder_finished) = decoder.step(time, inputs, state)
-                if decoder.tracks_own_finished:
-                    next_finished     = decoder_finished
-                else:
-                    next_finished     = math_ops.logical_or(decoder_finished, finished)
-
-                next_sequence_lengths = array_ops.where(math_ops.logical_not(finished), array_ops.fill(array_ops.shape(sequence_lengths), time + 1), sequence_lengths)
-
-                nest.assert_same_structure(state, decoder_state)
-                nest.assert_same_structure(outputs_ta, next_outputs)
-                nest.assert_same_structure(inputs, next_inputs)
-
-                # Zero out output values past finish
-                emit            = next_outputs
-                next_state          = decoder_state
-                outputs_ta      = nest.map_structure(lambda ta, out: ta.write(time, out), outputs_ta, emit)
-
-
-                return (time + 1, outputs_ta, next_state, next_inputs, next_finished, next_sequence_lengths)
-
-
-            for i in range(5):      #change this
-                res = body(initial_time, initial_outputs_ta, initial_state, self.inputs_placeholder, initial_finished, initial_sequence_lengths)
-
-                initial_time, initial_outputs_ta, initial_state, _, initial_finished, initial_sequence_lengths = res
-
-                # out              = nest.map_structure(lambda ta: ta.stack(), initial_outputs_ta)
-                # pdb.set_trace()
-                print(i)
-
-            final_outputs_ta        = res[1]
-            final_state             = res[2]
-            final_sequence_lengths  = res[5]
-
-
-            final_outputs              = nest.map_structure(lambda ta: ta.stack(), final_outputs_ta)
-            final_outputs, final_state = decoder.finalize(final_outputs, final_state, final_sequence_lengths)
-
-            if not output_time_major:
-                final_outputs              = nest.map_structure(_transpose_batch_time, final_outputs)
-
-        return final_outputs, final_state, final_sequence_lengths
-
-
     def evaluate(self, sess):
         sess.run(self.val_init)
 
-        with open('custom_beam_search', 'w') as f:
+        with open('output.txt', 'w') as f:
             while True:
                 try:
-                    # pdb.set_trace()
-                    out = self.dynamic_decode(self.inference_decoder)
-                    dec_out, next_outputs, ta = sess.run([self.dec_pred_decode, self.next_outputs[0], self.ta])
-                    pdb.set_trace()
+                    dec_out = sess.run([self.dec_pred_decode])
                     self.pred2txt(dec_out[0], f)
-
                     #write code to evaluate BLEU score here
 
                 except tf.errors.OutOfRangeError:
                     break
-
-    def cal_dpp(inp):
-        return inp
 
     def run_epoch(self, sess, epoch):
         # Training step
@@ -477,15 +355,13 @@ class Paraphraser(Model):
             try:
                 _, loss = sess.run([self.train_op, self.loss])
                 ep_loss += loss
-                # pdb.set_trace()
-                # break
-                step += 1
+                step    += 1
 
             except tf.errors.OutOfRangeError:
                 break
 
             if step % self.p.patience == 0:
-                self.logger.info("{} epoch: {} step: {} step_loss: {:.4f}".format(self.p.name, epoch, step, loss))
+                self.logger.info("{} E: {} S: {} step_loss: {:.4f}".format(self.p.name, epoch, step, loss))
 
         if ep_loss < self.min_loss:
             self.saver.save(sess=sess, save_path=self.save_path)
@@ -495,40 +371,31 @@ class Paraphraser(Model):
             self.log_db.update_one(
                 {'_id': self.p.name},
                 {'$set': {
-                    'train_loss':               float(ep_loss),
-                    'Params':           vars(self.p),
-                }
-            }, upsert=True)
+                            'train_loss':       float(ep_loss),
+                            'Params':           vars(self.p),
+                }}, upsert=True)
 
         except Exception as e:
             print('\nMongo ERROR Exception Cause: {}'.format(e.args[0]))
 
         self.logger.info('E:{} {} tr_loss: {:.3f} '.format(epoch, self.p.name, ep_loss))
-        # self.evaluate(sess, split='test')
 
     def fit(self, sess):
-        # self.summ_writer   = tf.summary.FileWriter("tf_board/Paraphraser/" + self.p.name, sess.graph)
-        self.saver     = tf.train.Saver()
-        save_dir       = 'checkpoints/' + self.p.name + '/'
+        self.summ_writer   = tf.summary.FileWriter("tf_board/Paraphraser/" + self.p.name, sess.graph)
+        self.saver         = tf.train.Saver()
+        save_dir           = 'checkpoints/' + self.p.name + '/'
+
         if not os.path.exists(save_dir): os.makedirs(save_dir)
         self.save_path     = os.path.join(save_dir, 'best_val_loss')
 
         self.best_val_loss  = 0.0
-        self.best_test_acc = 0.0
 
         if self.p.restore:
             self.saver.restore(sess, self.save_path)
 
-        if self.p.mode == 'train':
-            for epoch in range(self.p.max_epochs):
-                self.run_epoch(sess, epoch)
-        else:
+        for epoch in range(self.p.max_epochs):
+            self.run_epoch(sess, epoch)
             self.evaluate(sess)
-
-        # self.evaluate(sess, split='test')
-
-        # self.logger.info('Best Validation: {}, Best Test: {}, Best overall test {}'.format(self.best_val_acc, self.best_test_acc, self.ov_best_test_acc))
-
 
 if __name__== "__main__":
 
