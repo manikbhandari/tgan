@@ -1,3 +1,7 @@
+# tf
+src/checkpoints
+src/tf_board
+src/generations
 # data
 data/
 # Byte-compiled / optimized / DLL files

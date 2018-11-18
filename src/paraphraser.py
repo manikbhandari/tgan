@@ -2,9 +2,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from models import *
 from helper import *
-from utils  import *
 
 import tensorflow as tf, time
 from collections import Counter
@@ -58,7 +56,7 @@ from tensorflow.python.util import nest
 
 import tensorflow as tf
 
-class Paraphraser(Model):
+class Paraphraser():
 
     def get_dataset(self, source, target):
         '''
@@ -73,7 +71,8 @@ class Paraphraser(Model):
         dataset  = tf.data.Dataset.zip((source, target_inp, target_out))
         #Filter sents greater than 15
         dataset  = dataset.filter(lambda orig, para_inp, para_out: tf.logical_and(tf.logical_and(
-                                                                    tf.greater(20, tf.size(orig)), tf.greater(20, tf.size(para_inp))), tf.greater(20, tf.size(para_out))))
+                                                                    tf.greater(20, tf.size(orig)), tf.greater(20, tf.size(para_inp))),
+                                                                    tf.greater(20, tf.size(para_out))))
         #lookup indexes
         dataset  = dataset.map(lambda orig, para_inp, para_out: ((self.vocab_table.lookup(orig), tf.size(orig)),
                                                                  (self.vocab_table.lookup(para_inp), tf.size(para_inp)),
@@ -124,7 +123,7 @@ class Paraphraser(Model):
 
         cell = cell_type(self.p.hidden_size)
 
-        if self.p.use_dropout:  cell = DropoutWrapper(cell, dtype=self.p.dtype, output_keep_prob=self.keep_prob_placeholder)    #change this
+        if self.p.use_dropout:  cell = DropoutWrapper(cell, dtype=self.p.dtype, output_keep_prob=self.p.keep_prob)    #change this
         if self.p.use_residual: cell = ResidualWrapper(cell)
 
         return cell
@@ -134,16 +133,15 @@ class Paraphraser(Model):
         return MultiRNNCell([self.build_single_cell() for i in range(self.p.depth)])
 
     def build_dec_cell(self):
-        if self.use_beam_search:    #then tile
+        enc_outputs         = self.enc_outputs
+        enc_last_state      = self.enc_last_state
+        enc_inputs_length   = self.enc_inp_len
+
+        if self.use_beam_search:
             self.logger.info("using beam search decoding")
             enc_outputs         = seq2seq.tile_batch(self.enc_outputs, multiplier=self.p.beam_width)
             enc_last_state      = nest.map_structure( lambda s: seq2seq.tile_batch(s, self.p.beam_width), self.enc_last_state)
             enc_inputs_length   = seq2seq.tile_batch(self.enc_inp_len, self.p.beam_width)
-
-        else: #TRAINING
-            enc_outputs     = self.enc_outputs
-            enc_last_state      = self.enc_last_state
-            enc_inputs_length   = self.enc_inp_len
 
         if self.p.attention_type.lower() == 'luong':
             self.attention_mechanism = attention_wrapper.LuongAttention(   num_units=self.p.hidden_size, memory=enc_outputs, memory_sequence_length=enc_inputs_length)
@@ -157,14 +155,16 @@ class Paraphraser(Model):
                 _input_layer = Dense(self.p.hidden_size, dtype=self.p.dtype, name='attn_input_feeding')
                 return _input_layer(tf.concat([inputs, attention], -1))
 
-        self.dec_cell_list     = [self.build_single_cell() for i in range(self.p.depth)]
-        self.dec_cell_list[-1] = attention_wrapper.AttentionWrapper(cell                 = self.dec_cell_list[-1],
-                                                                    attention_mechanism  = self.attention_mechanism,
-                                                                    attention_layer_size = self.p.hidden_size,
-                                                                    cell_input_fn        = attn_dec_input_fn,
-                                                                    initial_cell_state   = enc_last_state[-1],
-                                                                    alignment_history    = False,
-                                                                    name                 = 'attention_wrapper')
+        self.dec_cell_list = [self.build_single_cell() for _ in range(self.p.depth)]
+
+        if self.p.use_attn:
+            self.dec_cell_list[-1] = attention_wrapper.AttentionWrapper(cell                 = self.dec_cell_list[-1],
+                                                                        attention_mechanism  = self.attention_mechanism,
+                                                                        attention_layer_size = self.p.hidden_size,
+                                                                        cell_input_fn        = attn_dec_input_fn,
+                                                                        initial_cell_state   = enc_last_state[-1],
+                                                                        alignment_history    = False,
+                                                                        name                 = 'attention_wrapper')
 
         batch_size           = self.p.batch_size if not self.use_beam_search else self.p.batch_size*self.p.beam_width
         initial_state        = [state for state in enc_last_state]
@@ -177,8 +177,9 @@ class Paraphraser(Model):
     def add_model(self):
         with tf.variable_scope("embed_lookup"):
             #modify initializer here to add glove/word2vec
+            embedding     = getGlove([wrd for wrd in self.vocab if wrd != '<unk>'], 'wiki_300')
             _wrd_embed    = tf.get_variable('embed_matrix',   [len(self.vocab)-1,  self.p.embed_dim],
-                                            initializer=tf.contrib.layers.xavier_initializer(), regularizer=self.regularizer)
+                                            initializer=tf.constant_initializer(embedding), regularizer=self.regularizer)
 
             wrd_pad       = tf.Variable(tf.zeros([1, self.p.embed_dim]), trainable=False)
             self.embed_matrix = tf.concat([_wrd_embed, wrd_pad], axis=0)
@@ -197,49 +198,49 @@ class Paraphraser(Model):
                                                                         time_major      = False,
                                                                         scope           = 'enc_rnn')
 
-        self.logger.info("Building decoder")
-        with tf.variable_scope("decoder"):
-            #------------------------------------------------------------------THIS PART IS FOR TRAINING ONLY----------------------------------------------------------------------
-            self.dec_cell, self.dec_initial_state = self.build_dec_cell()
+        self.dec_cell, self.dec_initial_state = self.build_dec_cell()
+        self.input_layer                      = Dense(self.p.hidden_size, name="input_projection")
+        self.output_layer                     = Dense(len(self.vocab),    name="output_projection")
 
-            input_layer     = Dense(self.p.hidden_size, name="input_projection")
-            output_layer    = Dense(len(self.vocab),    name="output_projection")
+        if self.p.mode == 'train':
+            self.logger.info("Building training decoder")
 
-            if self.p.mode == 'train':
-                self.dec_inp_embed = input_layer(self.dec_inp_embed) #decoder inputs dim should match encoder outputs dim
-                training_helper    = seq2seq.TrainingHelper(inputs=self.dec_inp_embed, sequence_length=self.dec_inp_len, time_major=False, name='training_helper')
-                training_decoder   = seq2seq.BasicDecoder(cell=self.dec_cell, helper=training_helper, initial_state=self.dec_initial_state, output_layer=output_layer)
-                max_decoder_length = tf.reduce_max(self.dec_inp_len)
+            self.dec_inp_embed = self.input_layer(self.dec_inp_embed) #decoder inputs dim should match encoder outputs dim
+            training_helper    = seq2seq.TrainingHelper(inputs=self.dec_inp_embed, sequence_length=self.dec_inp_len, time_major=False, name='training_helper')
+            training_decoder   = seq2seq.BasicDecoder(cell=self.dec_cell, helper=training_helper, initial_state=self.dec_initial_state,
+                                                      output_layer=self.output_layer)
+            self.max_decoder_length = tf.reduce_max(self.dec_inp_len)
 
-                (self.dec_outputs_train, self.dec_last_state_train, self.dec_outputs_length_train) = (seq2seq.dynamic_decode(decoder            = training_decoder,
-                                                                                                                             output_time_major  = False,
-                                                                                                                             impute_finished    = True,
-                                                                                                                             maximum_iterations = max_decoder_length)
-                                                                                                      )
+            (self.dec_outputs_train, self.dec_last_state_train, self.dec_outputs_length_train) = (seq2seq.dynamic_decode(
+                                                                                                     decoder            = training_decoder,
+                                                                                                     output_time_major  = False,
+                                                                                                     impute_finished    = True,
+                                                                                                     maximum_iterations = self.max_decoder_length)
+                                                                                                  )
 
-                #since output layer is passed to decoder, logits = output
-                self.dec_logits_train   = self.dec_outputs_train.rnn_output
-                self.dec_pred_train     = tf.argmax(self.dec_logits_train, axis=-1, name='decoder_pred_train')
-                masks                   = tf.sequence_mask(lengths=self.dec_inp_len, maxlen=tf.shape(self.dec_inp)[1], dtype=self.p.dtype, name='masks')
+            #since output layer is passed to decoder, logits = output
+            self.dec_logits_train   = self.dec_outputs_train.rnn_output
+            self.dec_pred_train     = tf.argmax(self.dec_logits_train, axis=-1, name='decoder_pred_train')
+            masks                   = tf.sequence_mask(lengths=self.dec_inp_len, maxlen=tf.shape(self.dec_inp)[1], dtype=self.p.dtype, name='masks')
 
-                self.loss = seq2seq.sequence_loss(logits                        = self.dec_logits_train,
-                                                       targets                  = self.dec_out,
-                                                       weights                  = masks,
-                                                       average_across_timesteps = True,
-                                                       average_across_batch     = True)
+            self.loss = seq2seq.sequence_loss(logits                        = self.dec_logits_train,
+                                                   targets                  = self.dec_out,
+                                                   weights                  = masks,
+                                                   average_across_timesteps = True,
+                                                   average_across_batch     = True)
 
-                tf.summary.scalar('loss', self.loss)
+            tf.summary.scalar('loss', self.loss)
 
-            #------------------------------------------------------------------THIS PART IS FOR DECODING ONLY----------------------------------------------------------------------
+        else:
             self.logger.info("building decoder for inference")
             start_tokens = tf.ones([self.p.batch_size], tf.int32) * tf.cast(self.vocab_table.lookup(tf.constant('<sos>')), tf.int32)
             # pdb.set_trace()
             end_token    = tf.cast(self.vocab_table.lookup(tf.constant('<eos>')), tf.int32)
 
             def embed_and_input_proj(inputs):
-                return input_layer(tf.nn.embedding_lookup(self.embed_matrix, inputs))
+                return self.input_layer(tf.nn.embedding_lookup(self.embed_matrix, inputs))
 
-            if not self.use_beam_search:
+            if not self.p.use_beam_search:
                 self.logger.info("Building greedy decoder")
 
                 decoding_helper     = seq2seq.GreedyEmbeddingHelper(start_tokens = start_tokens,
@@ -249,12 +250,10 @@ class Paraphraser(Model):
                 inference_decoder       = seq2seq.BasicDecoder( cell            = self.dec_cell,
                                                                 helper          = decoding_helper,
                                                                 initial_state   = self.dec_initial_state,
-                                                                output_layer    = output_layer)
+                                                                output_layer    = self.output_layer)
 
             else:
                 self.logger.info("Building beam search decoder")
-
-                self.inputs_placeholder = tf.placeholder(tf.float32, shape=[self.p.batch_size, self.p.beam_width])
 
                 inference_decoder = beam_search_decoder.BeamSearchDecoder(  cell          = self.dec_cell,
                                                                             embedding     = embed_and_input_proj,
@@ -262,12 +261,12 @@ class Paraphraser(Model):
                                                                             end_token     = end_token,
                                                                             initial_state = self.dec_initial_state,
                                                                             beam_width    = self.p.beam_width,
-                                                                            output_layer  = output_layer)
+                                                                            output_layer  = self.output_layer)
 
             (self.dec_out_decode, self.dec_last_state_decode,
-             self.dec_out_length_decode) = (seq2seq.dynamic_decode( inference_decoder_para, output_time_major=False, maximum_iterations=self.max_decode_step))
+             self.dec_out_length_decode) = (seq2seq.dynamic_decode( inference_decoder, output_time_major=False, maximum_iterations=self.p.max_decode_step))
 
-            if not self.use_beam_search_decode:
+            if not self.p.use_beam_search:
                 #batchsize X seq_len X 1
                 self.dec_pred_decode = tf.expand_dims(self.dec_out_decode.sample_id, -1)
             else:
@@ -297,31 +296,35 @@ class Paraphraser(Model):
         self.p = params
         self.logger = get_logger(self.p.name, self.p.log_dir, self.p.config_dir)
         self.log_db = MongoClient('mongodb://10.24.28.104:27017/')[self.p.log_db][self.p.log_db]
-        self.logger.info(vars(self.p)); pprint(vars(self.p))
+        if self.p.mode == 'train':
+            self.logger.info(vars(self.p)); pprint(vars(self.p))
 
         if self.p.l2 == 0.0: self.regularizer = None
-        else:        self.regularizer = tf.contrib.layers.l2_regularizer(scale=self.p.l2)
+        else:        self.regularizer         = tf.contrib.layers.l2_regularizer(scale=self.p.l2)
 
-        self.load_data()
-
-        self.use_beam_search = False
         if self.p.use_beam_search and self.p.mode == 'decode':
             self.use_beam_search = True
+        else:
+            self.use_beam_search = False
 
+        self.load_data()
         self.add_model()
 
         if self.p.mode == 'train':
             self.loss       = self.add_loss_op(self.loss)
             self.train_op   = self.add_optimizer(self.loss)
 
-        self.accuracy   = self.get_accuracy()
-
-
+        self.accuracy    = self.get_accuracy()
         self.merged_summ = tf.summary.merge_all()
-        self.summ_writer = None
+        self.min_loss    = 1e10
 
-        self.min_loss = 1e10
+        self.saver         = tf.train.Saver()
+        self.save_dir           = 'checkpoints/' + self.p.name + '/'
 
+        if not os.path.exists(self.save_dir): os.makedirs(self.save_dir)
+        self.save_path     = os.path.join(self.save_dir, 'best_val_loss')
+
+        self.best_val_loss  = 0.0
 
     def pred2txt(self, preds, f):
         ''' preds of shape B X T X BW
@@ -332,10 +335,13 @@ class Paraphraser(Model):
                 f.write(txt+'\n')
             f.write('\n')
 
+
     def evaluate(self, sess):
         sess.run(self.val_init)
 
-        with open('output.txt', 'w') as f:
+        write_filw = os.path.join('generations', self.p.out_file)
+        self.logger.info("writing predictions to {}".format(write_file))
+        with open(write_file, 'w') as f:
             while True:
                 try:
                     dec_out = sess.run([self.dec_pred_decode])
@@ -372,7 +378,7 @@ class Paraphraser(Model):
                 {'_id': self.p.name},
                 {'$set': {
                             'train_loss':       float(ep_loss),
-                            'Params':           vars(self.p),
+                            'Params':           {k:v for k, v in vars(self.p).items() if k != 'dtype'},
                 }}, upsert=True)
 
         except Exception as e:
@@ -381,20 +387,14 @@ class Paraphraser(Model):
         self.logger.info('E:{} {} tr_loss: {:.3f} '.format(epoch, self.p.name, ep_loss))
 
     def fit(self, sess):
-        self.summ_writer   = tf.summary.FileWriter("tf_board/Paraphraser/" + self.p.name, sess.graph)
-        self.saver         = tf.train.Saver()
-        save_dir           = 'checkpoints/' + self.p.name + '/'
-
-        if not os.path.exists(save_dir): os.makedirs(save_dir)
-        self.save_path     = os.path.join(save_dir, 'best_val_loss')
-
-        self.best_val_loss  = 0.0
 
         if self.p.restore:
             self.saver.restore(sess, self.save_path)
 
-        for epoch in range(self.p.max_epochs):
-            self.run_epoch(sess, epoch)
+        if self.p.mode == 'train':
+            for epoch in range(self.p.max_epochs):
+                self.run_epoch(sess, epoch)
+        else:
             self.evaluate(sess)
 
 if __name__== "__main__":
@@ -407,35 +407,38 @@ if __name__== "__main__":
     parser.add_argument('-name',        dest="name",       default='test',         help='Name of the run')
     parser.add_argument('-mode',        dest="mode",       default='train',        help='train/decode')
 
-    parser.add_argument('-lr',          dest="lr",         default=0.01,   type=float,     help='Learning rate')
-    parser.add_argument('-epoch',       dest="max_epochs",     default=1,    type=int,       help='Max epochs')
-    parser.add_argument('-l2',          dest="l2",         default=0.01,   type=float,     help='L2 regularization')
-    parser.add_argument('-seed',        dest="seed",       default=1234,   type=int,       help='Seed for randomization')
-    parser.add_argument('-opt',         dest="opt",        default='adam',         help='Optimizer to use for training')
-    parser.add_argument('-drop',        dest="dropout",    default=0,      type=float,     help='Dropout for full connected layer. Add support.')
-    parser.add_argument('-batch_size',      dest="batch_size",     default=32,     type=int,       help='batch size to use')
-    parser.add_argument('-dtype',         dest="dtype",    default=tf.float32,         help='Optimizer to use for training')
+    parser.add_argument('-lr',          dest="lr",         default=0.001,        type=float,     help='Learning rate')
+    parser.add_argument('-epoch',       dest="max_epochs",     default=1,       type=int,       help='Max epochs')
+    parser.add_argument('-l2',          dest="l2",         default=0.01,        type=float,     help='L2 regularization')
+    parser.add_argument('-seed',        dest="seed",       default=1234,        type=int,       help='Seed for randomization')
+    parser.add_argument('-opt',         dest="opt",        default='adam',                      help='Optimizer to use for training')
+    parser.add_argument('-drop',        dest="dropout",    default=0,           type=float,     help='Dropout for full connected layer. Add support.')
+    parser.add_argument('-batch_size',  dest="batch_size", default=32,          type=int,       help='batch size to use')
+    parser.add_argument('-dtype',       dest="dtype",      default=tf.float32,                  help='Optimizer to use for training')
 
-    parser.add_argument('-embed_dim',      dest="embed_dim",       default=64,     type=int,       help='embedding dimensions to use')
 
     parser.add_argument('-dump',        dest="dump",       action='store_true',        help='Dump results')
     parser.add_argument('-restore',     dest="restore",    action='store_true',        help='Restore from the previous best saved model')
     parser.add_argument('-log_db',      dest="log_db",     default='Paraphraser',      help='MongoDB database for dumping results')
     parser.add_argument('-logdir',      dest="log_dir",    default='/scratchd/home/shikhar/gcn_word_embed/src/log/',       help='Log directory')
-    parser.add_argument('-config',      dest="config_dir",     default='../config/',       help='Config directory')
-    parser.add_argument('-patience',    dest="patience",       default=10,     type=int,       help='how often to log output')
+    parser.add_argument('-config',      dest="config_dir", default='../config/',       help='Config directory')
+    parser.add_argument('-out_file',    dest="out_file",   default='output.txt',       help='Config directory')
+    parser.add_argument('-patience',    dest="patience",   default=10, type=int,       help='how often to log output')
 
     #Model parameters
-    parser.add_argument('-cell_type',       dest="cell_type",       default='lstm',         help='lstm or gru?')
-    parser.add_argument('-hidden_size',     dest="hidden_size",     default=128,      type=int,     help='Hidden dimensions of the enc/dec')
-    parser.add_argument('-depth',           dest="depth",           default=1,       type=int,      help='depth of enc/dec cells')
-    parser.add_argument('-use_dropout',     dest="use_dropout",     action='store_true',        help='')
-    parser.add_argument('-use_residual',    dest="use_residual",    action='store_true',        help='res connections?')
-    parser.add_argument('-beam_width',      dest="beam_width",      default=10,      type=int,      help='')
-    parser.add_argument('-attention_type',      dest="attention_type",      default='bahdanau',         help='luong/bahdanau')
-    parser.add_argument('-attn_input_feeding',  dest="attn_input_feeding",  action='store_true',        help='')
-    parser.add_argument('-use_beam_search',     dest="use_beam_search",     action='store_true',        help='')
-    parser.add_argument('-max_decode_step',     dest="max_decode_step",     default=20,       type=int,      help='depth of enc/dec cells')
+    parser.add_argument('-cell_type',           dest="cell_type",           default='lstm',                     help='lstm or gru?')
+    parser.add_argument('-hidden_size',         dest="hidden_size",         default=256,        type=int,       help='Hidden dimensions of the enc/dec')
+    parser.add_argument('-embed_dim',           dest="embed_dim",           default=300,        type=int,       help='embedding dimensions to use')
+    parser.add_argument('-depth',               dest="depth",               default=1,          type=int,       help='depth of enc/dec cells')
+    parser.add_argument('-use_dropout',         dest="use_dropout",         action='store_true',                help='')
+    parser.add_argument('-keep_prob',           dest="keep_prob",           default=0.3,        type=float,     help='')
+    parser.add_argument('-use_residual',        dest="use_residual",        action='store_true',                help='res connections?')
+    parser.add_argument('-beam_width',          dest="beam_width",          default=10,         type=int,       help='')
+    parser.add_argument('-attention_type',      dest="attention_type",      default='bahdanau',                 help='luong/bahdanau')
+    parser.add_argument('-attn_input_feeding',  dest="attn_input_feeding",  action='store_true',                help='')
+    parser.add_argument('-use_beam_search',     dest="use_beam_search",     action='store_true',                help='')
+    parser.add_argument('-use_attn',            dest="use_attn",            action='store_true',                help='')
+    parser.add_argument('-max_decode_step',     dest="max_decode_step",     default=20,          type=int,      help='depth of enc/dec cells')
 
 
     args = parser.parse_args()
@@ -447,14 +450,19 @@ if __name__== "__main__":
     np.random.seed(args.seed)
     set_gpu(args.gpu)
 
-    model = Paraphraser(args)
-
     config = tf.ConfigProto()
-    config.gpu_options.allow_growth=True
-    config.operation_timeout_in_ms=60000
+    config.gpu_options.allow_growth = True
+    config.operation_timeout_in_ms  = 60000
+
+    model = Paraphraser(args)
     with tf.Session(config=config) as sess:
         sess.run(tf.global_variables_initializer())
         tf.tables_initializer().run()
         model.fit(sess)
+
+    with open(os.path.join(model.save_dir, 'params'), 'w') as f:
+        params = vars(args)
+        params = {k: v for k,v in params.items() if k != 'dtype'}
+        json.dump(params, f)
 
     print('Model Trained Successfully!!')
