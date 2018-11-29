@@ -3,6 +3,7 @@ from __future__ import division
 from __future__ import print_function
 
 from helper import *
+from cal_bleu import compute_bleu
 
 import tensorflow as tf, time
 from collections import Counter
@@ -32,11 +33,10 @@ from datetime import datetime
 from collections import OrderedDict
 from collections import namedtuple
 
-import pdb
+import ipdb as pdb
 
 import abc
 import six
-import pdb
 
 from tensorflow.python.eager import context
 from tensorflow.python.framework import constant_op
@@ -94,9 +94,11 @@ class Paraphraser():
         '''
         self.id2w        = json.load(open('../data/quora/id2w.json'))
         self.w2id        = json.load(open('../data/quora/w2id.json'))
+
         self.vocab       = sorted([wrd for idx, wrd in self.id2w.items()])
         self.vocab_table = tf.contrib.lookup.index_table_from_tensor(mapping=tf.constant(self.vocab), num_oov_buckets=0, default_value=0)
         self.id2w        = {idx: self.vocab[idx] for idx in range(len(self.vocab))}
+        self.w2id        = {wrd: idx for idx, wrd in self.id2w.items()}
 
         print("loading data")
         #Load tokenized data
@@ -316,7 +318,6 @@ class Paraphraser():
 
         self.accuracy    = self.get_accuracy()
         self.merged_summ = tf.summary.merge_all()
-        self.min_loss    = 1e10
 
         self.saver         = tf.train.Saver()
         self.save_dir           = 'checkpoints/' + self.p.name + '/'
@@ -324,28 +325,62 @@ class Paraphraser():
         if not os.path.exists(self.save_dir): os.makedirs(self.save_dir)
         self.save_path     = os.path.join(self.save_dir, 'best_val_loss')
 
-        self.best_val_loss  = 0.0
+        self.best_val_loss  = 1e10
 
-    def pred2txt(self, preds, f):
+    def pred2txt(self, preds, orig, references, targets, f):
         ''' preds of shape B X T X BW
         '''
         for i in range(preds.shape[0]):
+            txt = ' '.join([self.id2w[ids] for ids in orig[i, :]])
+            f.write(txt+'\n')
+
+            txt = ' '.join([self.id2w[ids] for ids in references[i, :]])
+            f.write(txt+'\n')
+
+            txt = ' '.join([self.id2w[ids] for ids in targets[i, :]])
+            f.write(txt+'\n')
+
             for beam in range(preds.shape[2]):
                 txt = ' '.join([self.id2w[ids] for ids in preds[i, :, beam]])
+                # pdb.set_trace()
                 f.write(txt+'\n')
             f.write('\n')
 
 
+    def get_bleu(self, refs, hyps):
+        ''' ref shape: B X T, hyp shape; B X T X BW
+        '''
+        batch_bleu = []
+        for sent in range(refs.shape[0]):
+            ref       = refs[sent]
+            hyp       = hyps[sent]
+            sent_bleu = 0
+
+            for beam in range(hyp.shape[1]):
+                h          = [wrd for wrd in hyp[:, beam] if wrd != self.w2id['<eos>']]
+                ref        = [wrd for wrd in ref if wrd != 0 and wrd != self.w2id['<sos>']]
+                sent_bleu += compute_bleu([[ref]], [h])[0]
+
+            sent_blue = sent_bleu/hyp.shape[1]              #average across all beams
+            batch_bleu.append(sent_bleu)
+
+        return np.average(batch_bleu)
+
     def evaluate(self, sess):
         sess.run(self.val_init)
 
-        write_filw = os.path.join('generations', self.p.out_file)
+        write_file = os.path.join('generations', self.p.out_file)
         self.logger.info("writing predictions to {}".format(write_file))
+
         with open(write_file, 'w') as f:
             while True:
                 try:
-                    dec_out = sess.run([self.dec_pred_decode])
-                    self.pred2txt(dec_out[0], f)
+                    preds, enc_inp, dec_inp, dec_out = sess.run([self.dec_pred_decode, self.enc_inp, self.dec_inp, self.dec_out])
+                    # pdb.set_trace()
+                    # bleu             = self.get_bleu(dec_inp, dec_out)
+                    # self.logger.info("val bleu: {}".format(bleu))
+
+                    self.pred2txt(preds, enc_inp, dec_inp, dec_out,  f)
                     #write code to evaluate BLEU score here
 
                 except tf.errors.OutOfRangeError:
@@ -355,12 +390,12 @@ class Paraphraser():
         # Training step
         sess.run(self.train_init)
 
-        ep_loss = 0.0
-        step = 0
+        tr_loss = 0
+        step    = 0
         while True:
             try:
-                _, loss = sess.run([self.train_op, self.loss])
-                ep_loss += loss
+                _, loss  = sess.run([self.train_op, self.loss])
+                tr_loss += loss
                 step    += 1
 
             except tf.errors.OutOfRangeError:
@@ -369,22 +404,40 @@ class Paraphraser():
             if step % self.p.patience == 0:
                 self.logger.info("{} E: {} S: {} step_loss: {:.4f}".format(self.p.name, epoch, step, loss))
 
-        if ep_loss < self.min_loss:
+        # run on validation data
+        sess.run(self.val_init)
+
+        ep_loss = 0.0
+        step    = 0
+        while True:
+            try:
+                loss  = sess.run([self.loss])[0]
+                ep_loss += loss
+                step    += 1
+
+            except tf.errors.OutOfRangeError:
+                break
+
+            if step % self.p.patience == 0:
+                self.logger.info("{} E: {} S: {} step_loss_val: {:.4f}".format(self.p.name, epoch, step, loss))
+
+        if ep_loss < self.best_val_loss:
             self.saver.save(sess=sess, save_path=self.save_path)
-            self.min_loss = ep_loss
+            self.best_val_loss = ep_loss
 
-        try:
-            self.log_db.update_one(
-                {'_id': self.p.name},
-                {'$set': {
-                            'train_loss':       float(ep_loss),
-                            'Params':           {k:v for k, v in vars(self.p).items() if k != 'dtype'},
-                }}, upsert=True)
+            try:
+                self.log_db.update_one(
+                    {'_id': self.p.name},
+                    {'$set': {
+                                'val_loss':         float(ep_loss),
+                                'Params':           {k:v for k, v in vars(self.p).items() if k != 'dtype'},
+                    }}, upsert=True)
 
-        except Exception as e:
-            print('\nMongo ERROR Exception Cause: {}'.format(e.args[0]))
+            except Exception as e:
+                print('\nMongo ERROR Exception Cause: {}'.format(e.args[0]))
 
-        self.logger.info('E:{} {} tr_loss: {:.3f} '.format(epoch, self.p.name, ep_loss))
+        self.logger.info('E:{} {} tr_loss:  {:.3f} '.format(epoch, self.p.name, tr_loss))
+        self.logger.info('E:{} {} val_loss: {:.3f} '.format(epoch, self.p.name, ep_loss))
 
     def fit(self, sess):
 
@@ -399,16 +452,14 @@ class Paraphraser():
 
 if __name__== "__main__":
 
-    parser = argparse.ArgumentParser(description='WORD GCN')
+    parser = argparse.ArgumentParser(description='Paraphraser')
 
-    # parser.add_argument('-data',     dest="data",     default='/scratchd/home/shikhar/gcn_word_embed/new_data/main_full_gcn.txt', help='Dataset to use')
-    parser.add_argument('-data',        dest="data",       default='cora',         help='Dataset to use')
     parser.add_argument('-gpu',         dest="gpu",        default='0',            help='GPU to use')
     parser.add_argument('-name',        dest="name",       default='test',         help='Name of the run')
     parser.add_argument('-mode',        dest="mode",       default='train',        help='train/decode')
 
     parser.add_argument('-lr',          dest="lr",         default=0.001,        type=float,     help='Learning rate')
-    parser.add_argument('-epoch',       dest="max_epochs",     default=1,       type=int,       help='Max epochs')
+    parser.add_argument('-epoch',       dest="max_epochs", default=100,       type=int,       help='Max epochs')
     parser.add_argument('-l2',          dest="l2",         default=0.01,        type=float,     help='L2 regularization')
     parser.add_argument('-seed',        dest="seed",       default=1234,        type=int,       help='Seed for randomization')
     parser.add_argument('-opt',         dest="opt",        default='adam',                      help='Optimizer to use for training')
@@ -429,9 +480,9 @@ if __name__== "__main__":
     parser.add_argument('-cell_type',           dest="cell_type",           default='lstm',                     help='lstm or gru?')
     parser.add_argument('-hidden_size',         dest="hidden_size",         default=256,        type=int,       help='Hidden dimensions of the enc/dec')
     parser.add_argument('-embed_dim',           dest="embed_dim",           default=300,        type=int,       help='embedding dimensions to use')
-    parser.add_argument('-depth',               dest="depth",               default=1,          type=int,       help='depth of enc/dec cells')
+    parser.add_argument('-depth',               dest="depth",               default=2,          type=int,       help='depth of enc/dec cells')
     parser.add_argument('-use_dropout',         dest="use_dropout",         action='store_true',                help='')
-    parser.add_argument('-keep_prob',           dest="keep_prob",           default=0.3,        type=float,     help='')
+    parser.add_argument('-keep_prob',           dest="keep_prob",           default=0.7,        type=float,     help='')
     parser.add_argument('-use_residual',        dest="use_residual",        action='store_true',                help='res connections?')
     parser.add_argument('-beam_width',          dest="beam_width",          default=10,         type=int,       help='')
     parser.add_argument('-attention_type',      dest="attention_type",      default='bahdanau',                 help='luong/bahdanau')
@@ -455,14 +506,16 @@ if __name__== "__main__":
     config.operation_timeout_in_ms  = 60000
 
     model = Paraphraser(args)
-    with tf.Session(config=config) as sess:
-        sess.run(tf.global_variables_initializer())
-        tf.tables_initializer().run()
-        model.fit(sess)
 
     with open(os.path.join(model.save_dir, 'params'), 'w') as f:
         params = vars(args)
         params = {k: v for k,v in params.items() if k != 'dtype'}
         json.dump(params, f)
+
+    with tf.Session(config=config) as sess:
+        sess.run(tf.global_variables_initializer())
+        tf.tables_initializer().run()
+        model.fit(sess)
+
 
     print('Model Trained Successfully!!')

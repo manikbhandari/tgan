@@ -2,6 +2,7 @@
 src/checkpoints
 src/tf_board
 src/generations
+src/ganmodel_checkpoints
 # data
 data/
 # Byte-compiled / optimized / DLL files

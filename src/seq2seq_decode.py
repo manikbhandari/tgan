@@ -4,7 +4,7 @@ def get_args(config_file, args):
     name2val                 = json.load(open(config_file))
 
     name2val['mode']            = 'decode'
-    name2val['use_beam_search'] = True
+    name2val['use_beam_search'] = False
     name2val['restore']         = True
     name2val['use_dropout']     = False
     name2val['dtype']           = tf.float32
