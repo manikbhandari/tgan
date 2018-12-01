@@ -81,7 +81,7 @@ class GANModel:
         generator_input = z_noise
         self.logger.info("Building generator...")
 
-        with tf.variable_scope("generator"):
+        with tf.variable_scope("encoder/generator"):        #adding enoder to restore it from paraphraser
             layer_out = []
             layer_out.append(tf.contrib.layers.fully_connected(generator_input, self.generator_layer_units[0]))
 
@@ -152,7 +152,7 @@ class GANModel:
         self.logger.info("Setting optimizer")
 
         with tf.name_scope("generator_optimizer"):
-            generator_trainable_params = tf.trainable_variables("generator")
+            generator_trainable_params = tf.trainable_variables("encoder/generator")
             self.gen_opt               = self.gen_optimizer(learning_rate=self.gen_learning_rate)
             generator_grads            = tf.gradients(self.gen_loss, generator_trainable_params)
             clip_grads, _              = tf.clip_by_global_norm(generator_grads, self.max_grad_norm)
@@ -388,7 +388,7 @@ def run_gan_model(args, gpu_config):
                 train_writer.add_summary(summary, gstep)
                 logger.info("EPOCH : {}, ITERATION : {}, GENERATOR LOSS : {}".format(i, gstep, gen_loss))
 
-                for k in xrange(args.discriminator_iterations):
+                for k in range(args.discriminator_iterations):
                     outputs = train_data.next_batch(args.gan_batch_size)
 
                     j += 1
@@ -417,11 +417,12 @@ if __name__== "__main__":
 
     parser = argparse.ArgumentParser(description='GAN model')
 
-    parser.add_argument('-data',        dest="data",       default='../data/sample.json',  help='path to hidden states')
+    parser.add_argument('-data',        dest="data",       default='gan_data.json',        help='path to hidden states')
+    parser.add_argument('-seq2seq',     dest="seq2seq",    default='',                     help='path to hidden states')
     parser.add_argument('-gpu',         dest="gpu",        default='0',                    help='GPU to use')
     parser.add_argument('-name',        dest="name",       default='test',                 help='Name of the run')
 
-    parser.add_argument('-metadata',      dest="metadata",      default='train,orig_sentences,orig_hidden_state,para_sentences,para_hidden_state', help='keys of json file')
+    parser.add_argument('-metadata',      dest="metadata",      default='train,inp_sent,inp_hidden,tar_sent,tar_hidden', help='keys of json file')
 
     parser.add_argument('-annealing',         dest='annealing',         default=False,                  help='whether to anneal or not')
     parser.add_argument("-decay_factor",      dest='decay_factor',      default=0.01,   type=float,     help="exponential annealing decay rate")
@@ -434,51 +435,24 @@ if __name__== "__main__":
 
     parser.add_argument("-mean_noise",            dest='mean_noise',            default=0,      type=int,                    help="mean of the noise z to feed to the generator")
     parser.add_argument("-sigma_noise",           dest='sigma_noise',           default=1,      type=int,                   help="variance of the noise z to feed to the generator")
-    parser.add_argument("-gen_learning_rate",     dest='gen_learning_rate',     default=0.0001, type=float,                    help="Learning rate for generator")
+    parser.add_argument("-gen_learning_rate",     dest='gen_learning_rate',     default=0.0002, type=float,                    help="Learning rate for generator")
     parser.add_argument("-gen_optimizer",         dest='gen_optimizer',         default="adam",                     help="Select optimizer from 'adam', 'adadelta', 'rmsprop', 'sgd'")
-    parser.add_argument("-generator_layer_units", dest='generator_layer_units', default="600",                      help="Number of units in each layer in the generator")
+    parser.add_argument("-generator_layer_units", dest='generator_layer_units', default="256, 384",                      help="Number of units in each layer in the generator")
     parser.add_argument("-z_dim",                 dest='z_dim',                 default=64,      type=int,                    help="Dimension of the noise parameter z to feed to the generator")
 
     # Discriminator configurations
-    parser.add_argument("-disc_learning_rate",        dest='disc_learning_rate',        default=0.0001, type=float,                 help="Learning rate for discriminator")
+    parser.add_argument("-disc_learning_rate",        dest='disc_learning_rate',        default=0.0002, type=float,                 help="Learning rate for discriminator")
     parser.add_argument("-disc_optimizer",            dest='disc_optimizer',            default="adam",                 help="Select optimizer from 'adam', 'adadelta', 'rmsprop', 'sgd'")
-    parser.add_argument("-discriminator_layer_units", dest='discriminator_layer_units', default="100",                  help="Number of units in each layer in the discriminator")
+    parser.add_argument("-discriminator_layer_units", dest='discriminator_layer_units', default="256",                  help="Number of units in each layer in the discriminator")
     parser.add_argument("-discriminator_iterations",  dest='discriminator_iterations',  default=5, type=int,                     help="Number of iterations to train the discriminator before training the generator")
 
-    parser.add_argument('-lr',          dest="lr",         default=0.001,       type=float,     help='Learning rate')
-    parser.add_argument('-epoch',       dest="max_epochs", default=50,          type=int,       help='Max epochs')
-    parser.add_argument('-l2',          dest="l2",         default=0.01,        type=float,     help='L2 regularization')
     parser.add_argument('-seed',        dest="seed",       default=1234,        type=int,       help='Seed for randomization')
-    parser.add_argument('-opt',         dest="opt",        default='adam',                      help='Optimizer to use for training')
-    parser.add_argument('-drop',        dest="dropout",    default=0,           type=float,     help='Dropout for full connected layer. Add support.')
-    parser.add_argument('-dtype',       dest="dtype",      default=tf.float32,                  help='Optimizer to use for training')
-
-
-    parser.add_argument('-dump',        dest="dump",       action='store_true',        help='Dump results')
-    parser.add_argument('-restore',     dest="restore",    action='store_true',        help='Restore from the previous best saved model')
-    parser.add_argument('-log_db',      dest="log_db",     default='Paraphraser',      help='MongoDB database for dumping results')
     parser.add_argument('-logdir',      dest="log_dir",    default='/scratchd/home/shikhar/gcn_word_embed/src/log/',       help='Log directory')
     parser.add_argument('-config',      dest="config_dir", default='../config/',       help='Config directory')
-    parser.add_argument('-out_file',    dest="out_file",   default='output.txt',       help='Config directory')
-    parser.add_argument('-patience',    dest="patience",   default=10, type=int,       help='how often to log output')
-
-    #Model parameters
-    parser.add_argument('-cell_type',           dest="cell_type",           default='lstm',                     help='lstm or gru?')
-    parser.add_argument('-hidden_size',         dest="hidden_size",         default=256,        type=int,       help='Hidden dimensions of the enc/dec')
-    parser.add_argument('-embed_dim',           dest="embed_dim",           default=300,        type=int,       help='embedding dimensions to use')
-    parser.add_argument('-depth',               dest="depth",               default=1,          type=int,       help='depth of enc/dec cells')
-    parser.add_argument('-use_dropout',         dest="use_dropout",         action='store_true',                help='')
-    parser.add_argument('-keep_prob',           dest="keep_prob",           default=0.3,        type=float,     help='')
-    parser.add_argument('-use_residual',        dest="use_residual",        action='store_true',                help='res connections?')
-    parser.add_argument('-beam_width',          dest="beam_width",          default=10,         type=int,       help='')
-    parser.add_argument('-attention_type',      dest="attention_type",      default='bahdanau',                 help='luong/bahdanau')
-    parser.add_argument('-attn_input_feeding',  dest="attn_input_feeding",  action='store_true',                help='')
-    parser.add_argument('-use_beam_search',     dest="use_beam_search",     action='store_true',                help='')
-    parser.add_argument('-use_attn',            dest="use_attn",            action='store_true',                help='')
-    parser.add_argument('-max_decode_step',     dest="max_decode_step",     default=20,          type=int,      help='depth of enc/dec cells')
-
+    parser.add_argument('-hidden_size', dest="hidden_size",         default=512,        type=int,       help='Hidden dimensions of the enc/dec')
 
     args = parser.parse_args()
+    args.data = 'checkpoints/{}/{}'.format(args.seq2seq, args.data)
 
     tf.set_random_seed(args.seed)
     random.seed(args.seed)

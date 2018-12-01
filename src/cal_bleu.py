@@ -59,12 +59,10 @@ def compute_bleu(reference_corpus, translation_corpus, max_order=4, smooth=False
     precisions = [0] * max_order
     for i in range(0, max_order):
         if smooth:
-            precisions[i] = ((matches_by_order[i] + 1.) /
-                                             (possible_matches_by_order[i] + 1.))
+            precisions[i] = ((matches_by_order[i] + 1.) / (possible_matches_by_order[i] + 1.))
         else:
             if possible_matches_by_order[i] > 0:
-                precisions[i] = (float(matches_by_order[i]) /
-                                                 possible_matches_by_order[i])
+                precisions[i] = (float(matches_by_order[i]) / possible_matches_by_order[i])
             else:
                 precisions[i] = 0.0
 

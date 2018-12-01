@@ -3,14 +3,13 @@ from paraphraser import *
 def get_args(config_file, args):
     name2val                 = json.load(open(config_file))
 
-    name2val['mode']            = args.mode
+    name2val['mode']            = 'get_hidden'
     name2val['use_gan']         = False
     name2val['use_beam_search'] = True
-    # name2val['hidden_size']     /= 2            #this is tricky.
     name2val['restore']         = True
     name2val['use_dropout']     = False
     name2val['dtype']           = tf.float32
-    name2val['out_file']        = args.out_file
+    name2val['gan_data_file']   = args.gan_data
 
     named_tuple_constructor  = namedtuple('params', sorted(name2val))
     args                     = named_tuple_constructor(**name2val)
@@ -18,11 +17,10 @@ def get_args(config_file, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Paraphraser')
-    parser.add_argument('-name',     dest="name",     default='test', help='')
-    parser.add_argument('-mode',     dest="mode",     default='decode', help='')
+    parser.add_argument('-name',     dest="name",     default='test', help='name of seq2seq checkpoint to decode from')
     parser.add_argument('-gpu',      dest="gpu",      default='0',    help='')
-    parser.add_argument('-seed',     dest="seed",     default=1234,   type=int, help='')
-    parser.add_argument('-out_file', dest="out_file", default='seq2seq_output.txt',     help='')
+    parser.add_argument('-seed',     dest="seed",     default=1234,   type=int,    help='')
+    parser.add_argument('-gan_data', dest="gan_data", default='gan_data.json',     help='')
     args   = parser.parse_args()
 
     args   = get_args(os.path.join('./checkpoints', args.name, 'params'), args)
